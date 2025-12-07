@@ -16,3 +16,23 @@ loss.py 自监督学习涉及的LOSS函数
 pre_train_cross_subject.py 预训练深度学习模型的代码
 
 self_supervised_cross_subject.py 自监督学习需要用的代码
+
+2025-12-06 张津铭留，以上是原作者的内容
+
+
+总结与操作指南
+准备环境： 确保你安装了 torch, numpy, scipy。
+
+更新 Model： 复制我给的 EEGNet 代码，更新你的 model.py。
+
+开始训练： 运行 python train_swpc.py。
+
+这个脚本会自动调用你的 Loader，分别训练“预筛选”和“分类”两个模型。
+
+跑完后，当前目录下会出现 prescreen_model.pth 和 classifier_model.pth。这就是老师要的结果。
+
+测试控制： 运行 python inference_robot.py。
+
+如果看到控制台输出“指令：右手...”，说明你的整个异步脑控链路已经打通了！
+
+接下来的步骤就是将 inference_robot.py 中的 fake_data 替换为真实的脑电采集设备接口数据。
