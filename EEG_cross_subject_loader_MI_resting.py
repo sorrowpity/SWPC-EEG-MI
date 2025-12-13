@@ -1,4 +1,3 @@
-# EEG_cross_subject_loader_MI_resting.py (已修订 - 启用数据切割)
 import numpy as np
 import os
 from scipy.io import loadmat
@@ -87,6 +86,7 @@ class EEG_loader_resting:
 
         print(f"Prescreening数据形状: 训练X {train_x.shape}, 训练Y {train_y.shape}")
 
+        # 原始代码中的重复连接，保留原样
         train_x = np.concatenate(all_train_data, axis=0)
         train_y = np.concatenate(all_train_labels, axis=0)
 

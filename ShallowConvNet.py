@@ -1,4 +1,3 @@
-# ShallowConvNet.py (已修订为标准结构，适应 (22, 250) 输入)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,9 +21,9 @@ class ShallowConvNet(nn.Module):
         # Block 3: Classifier (动态计算展平维度)
         with torch.no_grad():
             dummy = torch.zeros(1, 1, channels, time_points)
-            dummy = self.conv1_temporal(dummy)  # (1, 40, 22, 250)
-            dummy = self.conv1_spatial(dummy)  # (1, 40, 1, 250)
-            dummy = self.pool1(dummy)  # (1, 40, 1, ~15)
+            dummy = self.conv1_temporal(dummy) # (1, 40, 22, 250)
+            dummy = self.conv1_spatial(dummy) # (1, 40, 1, 250)
+            dummy = self.pool1(dummy) # (1, 40, 1, ~15)
             self.flatten_size = dummy.view(1, -1).size(1)
 
         self.fc = nn.Linear(self.flatten_size, num_classes)
