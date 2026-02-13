@@ -29,31 +29,20 @@ class ShallowConvNet(nn.Module):
 
         self.fc = nn.Linear(self.flatten_size, num_classes)
 
+        # 辅助任务：Lyapunov 指数预测头 (回归任务)
+        self.dyn_head = nn.Sequential(
+            nn.Linear(self.flatten_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
     def forward(self, x):
-        # x shape: (Batch, 1, Channels, Time) -> (B, 1, 22, 250)
-        x = self.conv1_temporal(x)
-        x = self.conv1_spatial(x)
-        x = self.bn1(x)
-        x = self.elu1(x)
-
+        x = self.elu1(self.bn1(self.conv1_spatial(self.conv1_temporal(x))))
         x = self.pool1(x)
         x = self.dropout1(x)
+        feat = x.view(-1, self.flatten_size)
 
-        x = x.view(-1, self.flatten_size)
-        x = self.fc(x)
-        return x
+        cls_out = self.fc(feat)
+        dyn_out = self.dyn_head(feat)
+        return cls_out, dyn_out
 
-    def extract_feature(self, x):
-        """新增：提取全连接层之前的特征（用于SSL对比损失）"""
-        # 前向传播到dropout1之后、全连接层之前
-        x = self.conv1_temporal(x)
-        x = self.conv1_spatial(x)
-        x = self.bn1(x)
-        x = self.elu1(x)
-
-        x = self.pool1(x)
-        x = self.dropout1(x)
-
-        # 展平后返回特征（与forward中的x_flatten完全一致）
-        feature = x.view(-1, self.flatten_size)
-        return feature

@@ -1,11 +1,11 @@
-# EEGNet.py (修复版)
+# EEGNet.py
 import torch
 import torch.nn as nn
 import numpy as np
 
 
 class EEGNet(nn.Module):
-    def __init__(self, num_classes=4, channels=22, time_points=250, dropout_rate=0.5):
+    def __init__(self, num_classes=2, channels=22, time_points=250, dropout_rate=0.5):
         super(EEGNet, self).__init__()
 
         # Block 1: Temporal Convolution
@@ -20,22 +20,20 @@ class EEGNet(nn.Module):
         self.avg_pool1 = nn.AvgPool2d((1, 4))
         self.dropout1 = nn.Dropout(dropout_rate)
 
-        # === Block 3 & 4: Separable Convolution (拆分成单独的层以匹配权重文件) ===
-        # 对应权重中的 Missing key(s): "conv3.weight" (Depthwise Temporal Conv)
+        # === Block 3 & 4: Separable Convolution (匹配权重文件结构) ===
+        # 对应权重中的 conv3 (Depthwise Temporal Conv)
         self.conv3 = nn.Conv2d(16, 16, (1, 16), padding=(0, 8), groups=16, bias=False)
 
-        # 对应权重中的 Missing key(s): "conv4.weight", "batchnorm3.weight" (Pointwise Conv)
+        # 对应权重中的 conv4 和 batchnorm3 (Pointwise Conv)
         self.conv4 = nn.Conv2d(16, 16, (1, 1), bias=False)
         self.batchnorm3 = nn.BatchNorm2d(16)
         self.elu2 = nn.ELU()
         self.avg_pool2 = nn.AvgPool2d((1, 8))
         self.dropout2 = nn.Dropout(dropout_rate)
-        # =========================================================================
+        # =========================================================
 
-        # 针对 250 时间点的输入，计算展平后的维度
-        # Time dimension after Block 2: ceil(250 / 4) = 63
-        # Time dimension after Block 4: ceil(63 / 8) = 7
-        final_time_points = 7  # 修正：16 * 7 = 112 (解决 128 vs 112 的问题)
+        # 计算展平后的维度: 16 channels * 7 time points = 112
+        final_time_points = 7
         self.flatten_size = 16 * final_time_points
         self.fc = nn.Linear(self.flatten_size, num_classes)
 
@@ -47,18 +45,106 @@ class EEGNet(nn.Module):
         x = self.conv2(x)
         x = self.batchnorm2(x)
         x = self.elu(x)
-        x = self.avg_pool1(x)  # (B, 16, 1, 63)
+        x = self.avg_pool1(x) # (B, 16, 1, 63)
         x = self.dropout1(x)
 
-        # === 前向传播中新增 Block 3 & 4 逻辑 ===
+        # Block 3 & 4 逻辑
         x = self.conv3(x)
         x = self.conv4(x)
         x = self.batchnorm3(x)
         x = self.elu2(x)
-        x = self.avg_pool2(x)  # (B, 16, 1, 7)
+        x = self.avg_pool2(x) # (B, 16, 1, 7)
         x = self.dropout2(x)
-        # ======================================
 
         x = x.view(-1, self.flatten_size)
         x = self.fc(x)
         return x
+
+    def extract_feature(self, x):
+        """新增：SSL"""
+        # 前向传播到dropout2之后、全连接层之前（与forward逻辑完全对齐）
+        x = self.conv1(x)
+        x = self.batchnorm1(x)
+
+        x = self.conv2(x)
+        x = self.batchnorm2(x)
+        x = self.elu(x)
+        x = self.avg_pool1(x)
+        x = self.dropout1(x)
+
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.batchnorm3(x)
+        x = self.elu2(x)
+        x = self.avg_pool2(x)
+        x = self.dropout2(x)
+
+        # 展平后返回特征（与forward中的x_flatten完全一致）
+        feature = x.view(-1, self.flatten_size)
+        return feature
+
+class EEGNet_feature(nn.Module):
+    def __init__(self, in_channels, n_dim):
+        super(EEGNet_feature, self).__init__()
+        self.first_conv = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=(1, 51), stride=(1, 1), padding=(0, 25), bias=False),
+            nn.BatchNorm2d(16)
+        )
+        self.depthwise_conv = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=(in_channels, 1), stride=(1, 1), groups=16, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 4), stride=(1, 4), padding=0),
+            nn.Dropout(0.25)
+        )
+        self.separable_conv = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=(1, 15), stride=(1, 1), padding=(0, 7), bias=False),
+            nn.BatchNorm2d(32),
+            nn.ELU(),
+            nn.AvgPool2d(kernel_size=(1, 8), stride=(1, 8), padding=0),
+            nn.Dropout(0.25)
+        )
+        # 暂时将fc层注释，先动态计算维度；或在forward中动态计算
+        self.fc = None # 初始化时不定义，forward中动态创建（或先占位）
+        self.n_dim = n_dim # 保存特征维度
+
+    def forward(self, x, simsiam=False):
+        x = self.first_conv(x)
+        x = self.depthwise_conv(x)
+        x = self.separable_conv(x)
+        # 动态计算flatten后的维度
+        flatten_dim = x.size(1) * x.size(2) * x.size(3)
+        x = x.view(x.size(0), -1)
+        # 若fc层未创建，动态创建（仅第一次forward时执行）
+        if self.fc is None:
+            self.fc = nn.Linear(flatten_dim, self.n_dim).to(x.device)
+        x = self.fc(x)
+        return x
+
+    def extract_feature(self, x):
+        """新增：SSL"""
+        # 前向传播到separable_conv和dropout后，不经过fc层
+        x = self.first_conv(x)
+        x = self.depthwise_conv(x)
+        x = self.separable_conv(x)
+        # 展平后返回特征（fc层之前的原始特征）
+        flatten_dim = x.size(1) * x.size(2) * x.size(3)
+        feature = x.view(x.size(0), flatten_dim)
+        return feature
+
+class EEGNet_class(nn.Module):
+    def __init__(self, n_dim, num_classes=2):
+        super(EEGNet_class, self).__init__()
+        self.fc1 = nn.Linear(n_dim, 64)
+        self.fc2 = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+    def extract_feature(self, x):
+        """新增：SSL"""
+        # 返回fc1的输出特征（分类头的中间特征）
+        feature = torch.relu(self.fc1(x))
+        return feature

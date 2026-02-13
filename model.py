@@ -51,3 +51,22 @@ class EEGNet(nn.Module):
         x = x.view(-1, self.flatten_size)
         x = self.fc(x)
         return x
+
+    def extract_feature(self, x):
+        # 前向传播到dropout2之后、全连接层之前（与forward逻辑完全对齐）
+        x = self.conv1(x)
+        x = self.batchnorm1(x)
+        x = self.conv2(x)
+        x = self.batchnorm2(x)
+        x = self.elu(x)
+        x = self.avg_pool1(x)
+        x = self.dropout1(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.batchnorm3(x)
+        x = self.elu(x)
+        x = self.avg_pool2(x)
+        x = self.dropout2(x)
+        # 展平后返回特征（不经过全连接层）
+        feature = x.view(-1, self.flatten_size)
+        return feature

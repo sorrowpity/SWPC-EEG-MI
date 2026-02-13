@@ -1,0 +1,6 @@
+# requirements.txt
+# 注意：PyTorch/Torchvision/Torchaudio 必须在步骤 1 中单独安装，以确保 CUDA 兼容性。
+
+numpy
+scipy
+torchsummary

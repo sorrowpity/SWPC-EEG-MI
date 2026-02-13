@@ -1,98 +1,94 @@
-# EEG_cross_subject_loader_MI_resting.py (已修订 - 启用数据切割)
+# EEG_cross_subject_loader_MI_resting.py
 import numpy as np
 import os
 from scipy.io import loadmat
 from typing import Tuple, List
+from scipy.signal import welch
 
-# 假设你的.mat文件包含 string 标签: 'left_hand', 'right_hand', 'feet', 'tongue'
-MI_ACTION_MAP = {'left_hand': 1, 'right_hand': 2, 'feet': 3, 'tongue': 4}
+MI_ACTION_MAP = {'left_hand': 1, 'right_hand': 2, 'stop': 4}
 
 
 class EEG_loader_resting:
     def __init__(self, test_subj: int, data_dir: str = './data/'):
-        self.test_subj = test_subj
+        self.test_subj_id = test_subj  # 區分測試被試ID
         self.data_dir = data_dir
-        self.train_x, self.train_y, self.test_x, self.test_y = self.load_data()
+        # 增加存儲被試標籤的屬性
+        self.train_x, self.train_y, self.train_subj, self.test_x, self.test_y = self.load_data()
+
+    def _filter_by_erd(self, X_rest, X_mi, threshold=1.0):
+        keep_indices = []
+        motor_channels = [6, 10, 14]
+        for i in range(len(X_rest)):
+            ratios = []
+            for ch in motor_channels:
+                f_r, p_r = welch(X_rest[i, ch], fs=250, nperseg=128)
+                f_m, p_m = welch(X_mi[i, ch], fs=250)
+                band = np.where((f_r >= 8) & (f_r <= 30))[0]
+                res = np.mean(p_m[band]) / np.mean(p_r[band])
+                ratios.append(res)
+            if np.mean(ratios) < threshold:
+                keep_indices.append(i)
+        return keep_indices
 
     def load_data(self):
         all_train_data = []
         all_train_labels = []
+        all_train_subjs = []  # 新增：記錄訓練集被試ID
 
-        # 1. 加载训练数据 (Cross-Subject: 排除测试被试)
-        for s in range(1, 6):  # 假设被试编号 A1 到 A5
-            if s == self.test_subj:
-                continue
+        for s in range(1, 10):  # 假設你有9個被試 A1-A9
+            if s == self.test_subj_id: continue
 
             train_file = os.path.join(self.data_dir, f'train_A{s}.mat')
-            if not os.path.exists(train_file):
-                raise FileNotFoundError(f"训练文件不存在，请检查路径: {train_file}")
+            if not os.path.exists(train_file): continue
 
             mat_data = loadmat(train_file)
-            eeg_data = mat_data['X']  # 假设形状: (N_trials, Channels, Time_points)
-            labels = mat_data['y']
+            eeg_data = mat_data['X']
+            labels = np.squeeze(mat_data['y'])
 
-            # 找到所有MI试次的索引
-            labels_sq = np.squeeze(labels)
-            valid_mi_indices = [i for i, lbl in enumerate(labels_sq) if str(lbl).strip().lower() in MI_ACTION_MAP]
+            valid_indices = [i for i, lbl in enumerate(labels) if str(lbl).strip().lower() in MI_ACTION_MAP]
+            eeg_mi = eeg_data[valid_indices]
 
-            if not valid_mi_indices:
-                continue
+            X_rest = eeg_mi[:, :, 0:250]
+            X_mi = eeg_mi[:, :, 850:1100]
 
-            eeg_mi = eeg_data[valid_mi_indices]  # 仅MI试次数据
+            good_idx = self._filter_by_erd(X_rest, X_mi, threshold=1.0)
+            if not good_idx: continue
 
-            # === 数据切割，创建Resting Class ===
+            X_rest_clean = X_rest[good_idx]
+            X_mi_clean = X_mi[good_idx]
 
-            # 提取 Rest segment (时间点 250:500，对应 1s 到 2s，长度 250)
-            X_rest_segment = eeg_mi[:, :, 250:500]
-            y_rest_labels = np.zeros(X_rest_segment.shape[0], dtype=np.int64)  # 标签 0: Rest
+            X_subj = np.concatenate([X_rest_clean, X_mi_clean], axis=0)
+            y_subj = np.concatenate([np.zeros(len(good_idx)), np.ones(len(good_idx))], axis=0)
 
-            # 提取 MI segment (时间点 750:1000，对应 3s 到 4s，长度 250)
-            X_mi_segment = eeg_mi[:, :, 750:1000]
-            y_mi_labels = np.ones(X_mi_segment.shape[0], dtype=np.int64)  # 标签 1: MI
+            # --- 關鍵修改：記錄被試標籤 ---
+            # 每個樣本都標上它是來自被試 s
+            s_labels = np.full(len(X_subj), s)
 
-            # 合并 Rest 和 MI segments
-            X_train_subj = np.concatenate([X_rest_segment, X_mi_segment], axis=0)
-            y_train_subj = np.concatenate([y_rest_labels, y_mi_labels], axis=0)
-
-            all_train_data.append(X_train_subj)
-            all_train_labels.append(y_train_subj)
+            all_train_data.append(X_subj)
+            all_train_labels.append(y_subj)
+            all_train_subjs.append(s_labels)
 
         train_x = np.concatenate(all_train_data, axis=0)
-        train_y = np.concatenate(all_train_labels, axis=0)
+        train_y = np.concatenate(all_train_labels, axis=0).astype(np.int64)
+        train_subj = np.concatenate(all_train_subjs, axis=0)  # 輸出為 (N_samples,)
 
-        # 2. 加载测试数据 (Test Data Slicing - 相同逻辑)
-        test_file = os.path.join(self.data_dir, f'test_A{self.test_subj}.mat')
-        if not os.path.exists(test_file):
-            raise FileNotFoundError(f"测试文件不存在，请检查路径: {test_file}")
-
+        # --- 測試集處理 ---
+        test_file = os.path.join(self.data_dir, f'test_A{self.test_subj_id}.mat')
         mat_test = loadmat(test_file)
         test_x_raw = mat_test['X']
-        test_y_raw = mat_test['y']
+        test_y_raw = np.squeeze(mat_test['y'])
 
-        # 找到所有MI试次的索引
-        labels_sq = np.squeeze(test_y_raw)
-        valid_mi_indices = [i for i, lbl in enumerate(labels_sq) if str(lbl).strip().lower() in MI_ACTION_MAP]
+        t_idx = [i for i, lbl in enumerate(test_y_raw) if str(lbl).strip().lower() in MI_ACTION_MAP]
+        test_x_mi_raw = test_x_raw[t_idx]
 
-        test_x_mi = test_x_raw[valid_mi_indices]
+        T_rest = test_x_mi_raw[:, :, 0:250]
+        T_mi = test_x_mi_raw[:, :, 850:1100]
 
-        # 提取测试集的 Rest 和 MI segments
-        test_x_rest_segment = test_x_mi[:, :, 250:500]
-        test_y_rest_labels = np.zeros(test_x_rest_segment.shape[0], dtype=np.int64)
+        t_good_idx = self._filter_by_erd(T_rest, T_mi, threshold=1.0)
 
-        test_x_mi_segment = test_x_mi[:, :, 750:1000]
-        test_y_mi_labels = np.ones(test_x_mi_segment.shape[0], dtype=np.int64)
+        test_x = np.concatenate([T_rest[t_good_idx], T_mi[t_good_idx]], axis=0)
+        test_y = np.concatenate([np.zeros(len(t_good_idx)), np.ones(len(t_good_idx))], axis=0).astype(np.int64)
 
-        test_x = np.concatenate([test_x_rest_segment, test_x_mi_segment], axis=0)
-        test_y = np.concatenate([test_y_rest_labels, test_y_mi_labels], axis=0)
-
-        print(f"Prescreening数据形状: 训练X {train_x.shape}, 训练Y {train_y.shape}")
-
-        train_x = np.concatenate(all_train_data, axis=0)
-        train_y = np.concatenate(all_train_labels, axis=0)
-
-        # 检查平衡性
-        count_rest = np.sum(train_y == 0)
-        count_mi = np.sum(train_y == 1)
-        print(f"训练集标签分布: Rest(0)={count_rest}, MI(1)={count_mi}")
-
-        return train_x, train_y, test_x, test_y
+        print(f"篩選完成！訓練樣本: {len(train_x)}, 測試樣本: {len(test_x)}")
+        # 返回 5 個值
+        return train_x, train_y, train_subj, test_x, test_y
