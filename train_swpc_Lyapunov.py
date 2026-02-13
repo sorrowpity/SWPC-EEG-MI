@@ -1,3 +1,4 @@
+# train_swpc_Lyapunov.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,7 +8,7 @@ import os
 
 # 導入你的模型和加載器
 from model import EEGNet
-from ShallowConvNet import ShallowConvNet
+from ShallowConvNet_Lyapunov import ShallowConvNet
 from EEG_cross_subject_loader_MI_resting import EEG_loader_resting
 from EEG_cross_subject_loader_MI import EEG_loader
 from visualizer import plot_training_history
@@ -27,6 +28,32 @@ TEST_SUBJ = 1
 # =================================================================
 # 新增：标签归一化函数（核心修复）
 # =================================================================
+
+import nolds  # 請確保已安裝 pip install nolds
+
+
+def compute_lyapunov_labels(data_np):
+    """
+    data_np: (N, Channels, Time)
+    返回歸一化後的 Lyapunov 指數標籤 (N, 1)
+    """
+    print(f"--- 正在計算 {len(data_np)} 個樣本的 Lyapunov 複雜度標籤... ---")
+    lyaps = []
+    # 為了速度，我們對通道取平均後計算單通道的混沌度
+    for i in range(len(data_np)):
+        signal = np.mean(data_np[i], axis=0)
+        try:
+            # 250點較短，使用 Rosenstein 算法近似
+            l = nolds.lyap_r(signal, emb_dim=5, lag=None)
+        except:
+            l = 0.0
+        lyaps.append(l)
+
+    lyaps = np.array(lyaps).astype(np.float32)
+    # 歸一化到 0-1 之間，方便模型回歸
+    lyaps = (lyaps - lyaps.min()) / (lyaps.max() - lyaps.min() + 1e-6)
+    return lyaps
+
 def normalize_labels(labels):
     """
     将任意整数标签归一化为 0 开始的连续整数（0,1,2,...）
@@ -64,36 +91,48 @@ def augment_batch(inputs, shift_limit=25, noise_level=0.01):
 # =================================================================
 # III. 核心訓練流程 (含驗證與早停)
 # =================================================================
-def train_process(model, train_loader, val_loader, criterion, optimizer, save_path):
+def train_process(model, train_loader, val_loader, criterion, optimizer, save_path, is_stage1=False):
     best_val_loss = float('inf')
-    patience = 30  # 如果 30 輪驗證集 Loss 不降則停止
+    patience = 30
     counter = 0
-    history = {'loss': [], 'acc': [], 'val_loss': [], 'val_acc': []}  # 將 train_loss 改回 loss
+    history = {'loss': [], 'acc': [], 'val_loss': [], 'val_acc': []}
 
-    # --- 核心改進 1: 引入學習率調度器 ---
-    # 當 10 輪驗證集 Loss 不降時，將學習率乘以 0.5
+    # --- 新增：動力學損失函數 ---
+    mse_criterion = nn.MSELoss()
+    alpha = 0.5  # 混沌度預測任務的權重
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
 
-    print(f"開始訓練模型: {save_path}...")
-
     for epoch in range(EPOCHS):
-        # --- 訓練階段 ---
         model.train()
         t_loss, t_correct, t_total = 0, 0, 0
-        for inputs, labels in train_loader:
-            # Z-score 標準化
+
+        # 修改：增加 lyap_labels 的解包
+        for batch in train_loader:
+            if is_stage1:
+                inputs, labels, lyap_labels = batch
+                lyap_labels = lyap_labels.to(DEVICE)
+            else:
+                inputs, labels = batch
+
             inputs = (inputs - inputs.mean(dim=-1, keepdim=True)) / (inputs.std(dim=-1, keepdim=True) + 1e-6)
             inputs = inputs.unsqueeze(1).float().to(DEVICE)
-
-            # 訓練集才使用數據增強
             inputs = augment_batch(inputs, shift_limit=30, noise_level=0.02)
             labels = labels.long().to(DEVICE)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
 
+            # --- 核心修改：處理模型雙輸出 ---
+            if is_stage1:
+                outputs, pred_lyap = model(inputs)  # 獲取分類和回歸結果
+                loss_cls = criterion(outputs, labels)
+                loss_dyn = mse_criterion(pred_lyap.squeeze(), lyap_labels)
+                loss = loss_cls + alpha * loss_dyn  # 總 Loss
+            else:
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
 
@@ -106,12 +145,28 @@ def train_process(model, train_loader, val_loader, criterion, optimizer, save_pa
         model.eval()
         v_loss, v_correct, v_total = 0, 0, 0
         with torch.no_grad():
-            for inputs, labels in val_loader:
+            for batch in val_loader:  # 修改：不要直接用 inputs, labels
+                # 核心修复：解包逻辑必须与训练阶段一致
+                if is_stage1:
+                    inputs, labels, lyap_labels = batch
+                    lyap_labels = lyap_labels.to(DEVICE)
+                else:
+                    inputs, labels = batch
+
                 inputs = (inputs - inputs.mean(dim=-1, keepdim=True)) / (inputs.std(dim=-1, keepdim=True) + 1e-6)
                 inputs = inputs.unsqueeze(1).float().to(DEVICE)
                 labels = labels.long().to(DEVICE)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
+
+                # 同样处理双输出
+                if is_stage1:
+                    outputs, pred_lyap = model(inputs)
+                    loss_cls = criterion(outputs, labels)
+                    loss_dyn = mse_criterion(pred_lyap.squeeze(), lyap_labels)
+                    loss = loss_cls + alpha * loss_dyn
+                else:
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+
                 v_loss += loss.item()
                 _, pred = torch.max(outputs, 1)
                 v_total += labels.size(0)
@@ -211,8 +266,16 @@ def main():
     # 对 Stage 1 标签也做归一化（保险）
     train_y_norm_1 = normalize_labels(loader_rest.train_y)
 
+    # --- 關鍵：在此處計算 Lyapunov 標籤 ---
+    train_lyap = compute_lyapunov_labels(train_x_ea)
+
     # 修改原本的 TensorDataset，使用 train_x_ea 和归一化后的标签
-    full_ds_1 = TensorDataset(torch.from_numpy(train_x_ea), torch.from_numpy(train_y_norm_1))
+    # 修改 TensorDataset，多傳入一個標籤
+    full_ds_1 = TensorDataset(
+        torch.from_numpy(train_x_ea),
+        torch.from_numpy(train_y_norm_1),
+        torch.from_numpy(train_lyap)  # <--- 新增
+    )
 
     # 80/20 劃分
     train_size = int(0.8 * len(full_ds_1))
@@ -227,7 +290,7 @@ def main():
     criterion = nn.CrossEntropyLoss(label_smoothing=0.15)
     optimizer_1 = optim.Adam(model_1.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    train_process(model_1, train_loader_1, val_loader_1, criterion, optimizer_1, 'prescreen_model.pth')
+    train_process(model_1, train_loader_1, val_loader_1, criterion, optimizer_1, 'prescreen_model.pth', is_stage1=True)
 
     # --- 分割線 ---
 

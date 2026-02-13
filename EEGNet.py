@@ -1,10 +1,11 @@
+# EEGNet.py
 import torch
 import torch.nn as nn
 import numpy as np
 
 
 class EEGNet(nn.Module):
-    def __init__(self, num_classes=4, channels=22, time_points=250, dropout_rate=0.5):
+    def __init__(self, num_classes=2, channels=22, time_points=250, dropout_rate=0.5):
         super(EEGNet, self).__init__()
 
         # Block 1: Temporal Convolution
@@ -59,6 +60,29 @@ class EEGNet(nn.Module):
         x = self.fc(x)
         return x
 
+    def extract_feature(self, x):
+        """新增：SSL"""
+        # 前向传播到dropout2之后、全连接层之前（与forward逻辑完全对齐）
+        x = self.conv1(x)
+        x = self.batchnorm1(x)
+
+        x = self.conv2(x)
+        x = self.batchnorm2(x)
+        x = self.elu(x)
+        x = self.avg_pool1(x)
+        x = self.dropout1(x)
+
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.batchnorm3(x)
+        x = self.elu2(x)
+        x = self.avg_pool2(x)
+        x = self.dropout2(x)
+
+        # 展平后返回特征（与forward中的x_flatten完全一致）
+        feature = x.view(-1, self.flatten_size)
+        return feature
+
 class EEGNet_feature(nn.Module):
     def __init__(self, in_channels, n_dim):
         super(EEGNet_feature, self).__init__()
@@ -97,8 +121,19 @@ class EEGNet_feature(nn.Module):
         x = self.fc(x)
         return x
 
+    def extract_feature(self, x):
+        """新增：SSL"""
+        # 前向传播到separable_conv和dropout后，不经过fc层
+        x = self.first_conv(x)
+        x = self.depthwise_conv(x)
+        x = self.separable_conv(x)
+        # 展平后返回特征（fc层之前的原始特征）
+        flatten_dim = x.size(1) * x.size(2) * x.size(3)
+        feature = x.view(x.size(0), flatten_dim)
+        return feature
+
 class EEGNet_class(nn.Module):
-    def __init__(self, n_dim, num_classes):
+    def __init__(self, n_dim, num_classes=2):
         super(EEGNet_class, self).__init__()
         self.fc1 = nn.Linear(n_dim, 64)
         self.fc2 = nn.Linear(64, num_classes)
@@ -107,3 +142,9 @@ class EEGNet_class(nn.Module):
         x = torch.relu(self.fc1(x))
         x = self.fc2(x)
         return x
+
+    def extract_feature(self, x):
+        """新增：SSL"""
+        # 返回fc1的输出特征（分类头的中间特征）
+        feature = torch.relu(self.fc1(x))
+        return feature

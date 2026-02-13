@@ -1,4 +1,3 @@
-# inference_robot.py
 import numpy as np
 import time
 import json
@@ -11,12 +10,11 @@ from collections import deque, Counter
 from utils_ea import compute_EA_matrix
 
 # =================================================================
-# I. 配置參數 (加入 Socket 地址)
+# I. 配置參數 (加入动态阈值+自适应投票)
 # =================================================================
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# 模式切換
-DEPLOY_MODE = False # True: 輸出到機械臂；False: 僅本地打印
-DATA_SOURCE_MODE = "REAL_DATASET"  # "REAL_DATASET" 或 "LIVE_SOCKET"
+DEPLOY_MODE = False
+DATA_SOURCE_MODE = "REAL_DATASET"
 
 EEG_IP, EEG_PORT = '127.0.0.1', 12345
 ROBOT_IP, ROBOT_PORT = '127.0.0.1', 8888
@@ -25,19 +23,25 @@ CHANNELS = 22
 TIME_POINTS = 250
 SAMPLE_RATE = 250
 STEP_SIZE = 10
-THRESHOLD = 0.55
+# 核心优化1：动态阈值基准值（从0.6→0.75，作为动态调整的基准）
+THRESHOLD_BASE = 0.82
 DROPOUT_RATE = 0.5
+# 新增：动态阈值滑动窗口大小
+MI_P_WINDOW = 5
+# 新增：自适应投票门槛（MI概率越高，门槛越低）
+VOTE_THRESHOLD_HIGH = 5  # MI概率>0.8时，需要6票
+VOTE_THRESHOLD_LOW = 6   # MI概率<0.8时，需要8票
 
 
 # =================================================================
-# II. 數據加載接口 (加入 LIVE_SOCKET 適配)
+# II. 數據加載接口 (保持不变)
 # =================================================================
 class DataLoaderInterface:
     def __init__(self, mode, channels, time_points, test_subj=1, start_from_mi=False):
         self.mode = mode
         self.CHANNELS, self.TIME_POINTS = channels, time_points
         self.current_idx = 0
-        self.R = None  # 存儲對齊矩陣
+        self.R = None
 
         if self.mode == "REAL_DATASET":
             from EEG_cross_subject_loader_MI_resting import EEG_loader_resting
@@ -50,7 +54,6 @@ class DataLoaderInterface:
                 self.R = compute_EA_matrix(rest_samples)
                 print(f"✅ EA 對齊矩陣計算完成，樣本數: {len(rest_samples)}")
         else:
-            # 初始化腦控設備 Socket
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setblocking(True)
             try:
@@ -77,7 +80,6 @@ class DataLoaderInterface:
             self.current_idx += step_size
             return window.astype(np.float32), label_name
         else:
-            # 從 Socket 讀取實時數據
             packet_size = CHANNELS * TIME_POINTS * 4
             try:
                 data = self.sock.recv(packet_size, socket.MSG_WAITALL)
@@ -89,7 +91,7 @@ class DataLoaderInterface:
 
 
 # =================================================================
-# III. BCI 控制器 (加入機械臂輸出適配)
+# III. BCI 控制器 (核心优化：动态阈值+自适应投票)
 # =================================================================
 from EEGNet import EEGNet
 from ShallowConvNet import ShallowConvNet
@@ -102,10 +104,11 @@ class BCI_Controller:
         self.model_1 = ShallowConvNet(2, channels, time_points, DROPOUT_RATE).to(device)
         self.model_2 = EEGNet(2, channels, time_points, DROPOUT_RATE).to(device)
         self._load_weights()
-        self.vote_buffer = deque(maxlen=20)
+        # 核心优化2：投票窗口大小从20→15，平衡响应速度和稳定性
+        self.vote_buffer = deque(maxlen=10)
+        # 新增：MI概率滑动窗口，用于计算动态阈值
+        self.mi_p_buffer = deque(maxlen=MI_P_WINDOW)
 
-
-        # 初始化機械臂 Socket
         self.robot_sock = None
         if self.DEPLOY_MODE:
             try:
@@ -117,34 +120,13 @@ class BCI_Controller:
                 self.DEPLOY_MODE = False
 
     def _load_weights(self):
-        # root = os.path.dirname(os.path.abspath(__file__))
-        # self.model_1.load_state_dict(torch.load(os.path.join(root, 'models/prescreen_model_noSSL.pth'), map_location=self.DEVICE))
-        # self.model_2.load_state_dict(torch.load(os.path.join(root, 'models/classifier_model_noSSL.pth'), map_location=self.DEVICE))
-        # self.model_1.load_state_dict(torch.load(os.path.join(root, 'prescreen_model.pth'), map_location=self.DEVICE))
-        # self.model_2.load_state_dict(torch.load(os.path.join(root, 'classifier_model.pth'), map_location=self.DEVICE))
-        # self.model_1.eval()
-        # self.model_2.eval()
-
         root = os.path.dirname(os.path.abspath(__file__))
-
-        # --- 修复 Stage 1 加载逻辑 ---
-        path1 = os.path.join(root, 'prescreen_model.pth')
-        state_dict_1 = torch.load(path1, map_location=self.DEVICE)
-
-        # 核心：使用 strict=False。它会加载匹配的卷积层和分类层，自动跳过不匹配的 dyn_head
-        self.model_1.load_state_dict(state_dict_1, strict=False)
-
-        # --- 修复 Stage 2 加載邏輯 ---
-        path2 = os.path.join(root, 'classifier_model.pth')
-        state_dict_2 = torch.load(path2, map_location=self.DEVICE)
-        self.model_2.load_state_dict(state_dict_2, strict=False)  # 同样建议加上，防止未来报错
-
+        self.model_1.load_state_dict(torch.load(os.path.join(root, 'prescreen_model_ssl.pth'), map_location=self.DEVICE))
+        self.model_2.load_state_dict(torch.load(os.path.join(root, 'classifier_model_ssl.pth'), map_location=self.DEVICE))
         self.model_1.eval()
         self.model_2.eval()
-        print("✅ 模型权重加载成功！(已兼容动力学辅助头)")
 
     def process_data(self, eeg_window: np.ndarray, R_matrix=None):
-        # --- [EA 關鍵步驟] 應用對齊 ---
         from utils_ea import apply_EA
         if R_matrix is not None:
             eeg_window = apply_EA(eeg_window, R_matrix)
@@ -154,14 +136,20 @@ class BCI_Controller:
 
         with torch.no_grad():
             prob_mi = F.softmax(self.model_1(tensor), dim=1)[0, 1].item()
-            raw_pred = 4
-            conf = 1.0 - prob_mi if prob_mi < THRESHOLD else 0.0
+            # 核心优化3：计算动态阈值（基于MI概率的滑动平均值调整）
+            self.mi_p_buffer.append(prob_mi)
+            mi_p_avg = np.mean(self.mi_p_buffer) if self.mi_p_buffer else prob_mi
+            # 动态阈值：基准值±0.05，根据平均MI概率调整
+            dynamic_threshold = THRESHOLD_BASE + (mi_p_avg - 0.7) * 0.1
+            dynamic_threshold = np.clip(dynamic_threshold, 0.7, 0.8)  # 限制在0.7~0.8之间
 
-            if prob_mi >= THRESHOLD:
+            raw_pred = 4
+            conf = 1.0 - prob_mi if prob_mi < dynamic_threshold else 0.0
+
+            if prob_mi >= dynamic_threshold:
                 out2 = self.model_2(tensor)
                 soft_out2 = F.softmax(out2, dim=1)
                 conf2, pred2 = torch.max(soft_out2, dim=1)
-                # 方向映射: 0->LEFT, 1->RIGHT
                 raw_pred = 1 if pred2.item() == 0 else 2
                 conf = conf2.item()
 
@@ -169,21 +157,21 @@ class BCI_Controller:
             counts = Counter(self.vote_buffer)
             most_common, count = counts.most_common(1)[0]
 
-            # 1. 動作判定 (LEFT/RIGHT): 門檻稍微放寬，但依然保持緩衝
-            if most_common in [1, 2]:
-                # 只要 15 幀裡有 5 幀是動作，且當前 MI Prob 超過一個較低的門檻
-                if count >= 10:
-                    final_id = most_common
-                else:
-                    final_id = 4
-            # 2. 靜息判定 (STOP): 只要有一半的趨勢是停止，就立刻停止
+
+            # 核心优化4：自适应投票门槛（根据MI概率高低调整）
+            final_id = 4  # 默认判定为STOP
+            if prob_mi >= 0.7:  # 仅当MI概率≥0.7时，才判断是否为MI
+                if most_common in [1, 2]:
+                    vote_threshold = VOTE_THRESHOLD_HIGH if prob_mi >= 0.8 else VOTE_THRESHOLD_LOW
+                    if count >= vote_threshold:
+                        final_id = most_common
+                # 否则保持final_id=4
             else:
-                final_id = 4
+                self.vote_buffer.append(4)  # MI概率<0.7，强制加STOP到投票池
 
             cmd_map = {1: "LEFT", 2: "RIGHT", 4: "STOP"}
             cmd_name = cmd_map[final_id]
 
-            # 輸出至機械臂
             if self.DEPLOY_MODE and self.robot_sock:
                 msg = json.dumps({"cmd": cmd_name, "conf": round(float(conf), 4)}) + "\n"
                 try:
@@ -191,22 +179,20 @@ class BCI_Controller:
                 except:
                     pass
 
-            return cmd_name, prob_mi, conf
+            return cmd_name, prob_mi, conf, dynamic_threshold  # 返回动态阈值，用于调试
 
 
 # =================================================================
 # IV. 主模擬循環 (run_simulation)
 # =================================================================
 def run_simulation():
-    # 傳入 DEPLOY_MODE 參數
     controller = BCI_Controller(CHANNELS, TIME_POINTS, DEVICE, DEPLOY_MODE)
-    # 傳入 DATA_SOURCE_MODE 參數
     data_io = DataLoaderInterface(DATA_SOURCE_MODE, CHANNELS, TIME_POINTS)
 
     stats = {"rest_steps": 0, "rest_correct": 0, "mi_steps": 0, "mi_correct": 0}
 
-    print(f"\n{'=' * 85}\n BCI 異步控制與實時統計系統\n{'=' * 85}")
-    header = f"{'Step':<5} | {'真實動作':<8} | {'MI 概率':<7} | {'預測指令':<8} | {'當前準確率'} | {'延遲'}"
+    print(f"\n{'=' * 85}\n BCI 異步控制與實時統計系統（动态阈值版）\n{'=' * 85}")
+    header = f"{'Step':<5} | {'真實動作':<8} | {'MI 概率':<7} | {'動態閾值':<7} | {'預測指令':<8} | {'當前準確率'} | {'延遲'}"
     print(header)
     print("-" * len(header))
 
@@ -217,7 +203,7 @@ def run_simulation():
             eeg, real_action = data_io.get_next_window(STEP_SIZE)
             if eeg is None: break
 
-            pred_cmd, mi_p, conf = controller.process_data(eeg, R_matrix=data_io.R)
+            pred_cmd, mi_p, conf, dynamic_thresh = controller.process_data(eeg, R_matrix=data_io.R)
             step += 1
 
             acc_val = 0.0
@@ -225,31 +211,26 @@ def run_simulation():
                 stats["rest_steps"] += 1
                 if pred_cmd == 'STOP': stats["rest_correct"] += 1
                 acc_val = stats["rest_correct"] / stats["rest_steps"]
-            elif real_action != 'LIVE':  # LIVE 模式不統計準確率
+            elif real_action != 'LIVE':
                 stats["mi_steps"] += 1
                 if pred_cmd == real_action: stats["mi_correct"] += 1
                 if stats["mi_steps"] > 0:
                     acc_val = stats["mi_correct"] / stats["mi_steps"]
 
-            # --- 輸出控制 ---
             if DEPLOY_MODE:
-                # 部署模式下，每 10 步打印一次狀態，避免刷屏
                 if step % 10 == 0:
                     print(f">>> 已發送指令: {pred_cmd:<6} | MI Prob: {mi_p:.2f} | Step: {step}", end='\r')
             else:
-                # 本地調試模式，全量打印
-                print(f"#{step:04d} | {real_action:<8} | {mi_p:7.2f} | {pred_cmd:<8} | {acc_val * 100:5.1f}%")
+                elapsed = time.perf_counter() - t_cycle_start
+                print(f"#{step:04d} | {real_action:<8} | {mi_p:7.2f} | {dynamic_thresh:7.2f} | {pred_cmd:<8} | {acc_val * 100:5.1f}% | {elapsed*1000:4.1f}ms")
 
-            # --- 頻率控制：確保處理節奏不超過數據產生速度 (對應 STEP_SIZE) ---
-            # 數據集模式需要 sleep；Socket 模式通常由數據源發送速度決定，但這裡做一個保護
             elapsed = time.perf_counter() - t_cycle_start
             wait_time = max(0, (STEP_SIZE / SAMPLE_RATE) - elapsed)
-
+            # time.sleep(wait_time)
 
     except KeyboardInterrupt:
         print("\n[用戶中斷]")
     finally:
-        # 最終結算報告 (與原版一致)
         print(f"\n\n{'=' * 30} 性能統計總結 {'=' * 30}")
         if stats["rest_steps"] > 0:
             rest_acc = (stats["rest_correct"] / stats["rest_steps"]) * 100
